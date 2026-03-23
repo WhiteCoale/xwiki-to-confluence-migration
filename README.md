@@ -28,18 +28,24 @@ A robust Go-based tool to migrate content from xWiki (v17.x+) to Confluence Clou
 
 ## How to Use (Step-by-Step)
 
-### Step 1: Export from xWiki
-Fetch all content from xWiki and save it to a local data structure for inspection.
-```bash
-go run . --mode export --xwiki-url http://localhost:8080 --xwiki-user Admin --xwiki-password admin
-```
-*Creates an `./export` directory with JSON metadata and HTML content.*
+### Step 1: Export from xWiki (Offline-Ready)
+The export is designed to be run on your local network or a secured machine. 
 
-### Step 2: Import to Confluence
-Upload the locally stored data into your Confluence Cloud space.
+1.  **Configure**: Set your xWiki credentials in `.env`.
+2.  **Run**:
+    ```bash
+    ./migration.exe --mode export
+    ```
+    *(Or `go run . --mode export` if you have Go installed on the machine)*
+    
+This creates an `./export` directory with all content ready for transfer.
+
+### Step 2: Import to Confluence (Online)
+Transfer the contents of the `./export` directory to a machine with internet access and run:
 ```bash
-go run . --mode import --confluence-url https://your-domain.atlassian.net/wiki --confluence-space-key YOURSPACE
+./migration.exe --mode import
 ```
+*(Ensure `.env` contains your Confluence URL and Token on this machine)*
 
 ## Offline Use (Portable Export)
 
