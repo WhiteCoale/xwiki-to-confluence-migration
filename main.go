@@ -8,40 +8,38 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// Load .env file
+	_ = godotenv.Load()
+
 	// xWiki flags
-	xwikiURL := flag.String("xwiki-url", "http://localhost:8080", "xWiki base URL")
-	xwikiUser := flag.String("xwiki-user", "Admin", "xWiki username")
-	xwikiPassword := flag.String("xwiki-password", "admin", "xWiki password")
+	xwikiURL := flag.String("xwiki-url", getEnv("XWIKI_URL", "http://localhost:8080"), "xWiki base URL")
+	xwikiUser := flag.String("xwiki-user", getEnv("XWIKI_USER", "Admin"), "xWiki username")
+	xwikiPassword := flag.String("xwiki-password", getEnv("XWIKI_PASSWORD", "admin"), "xWiki password")
 
 	// Confluence flags
-	confluenceURL := flag.String("confluence-url", "https://whitecoale.atlassian.net/wiki", "Confluence Cloud base URL")
-	confluenceUser := flag.String("confluence-user", "", "Confluence user email (or set CONFLUENCE_USER env var)")
-	confluenceToken := flag.String("confluence-token", "", "Confluence API token (or set CONFLUENCE_TOKEN env var)")
-	confluenceSpaceKey := flag.String("confluence-space-key", "XWIKI", "Target Confluence space key")
-	confluenceSpaceName := flag.String("confluence-space-name", "xWiki Import", "Target Confluence space name (used when creating)")
+	confluenceURL := flag.String("confluence-url", getEnv("CONFLUENCE_URL", "https://whitecoale.atlassian.net/wiki"), "Confluence Cloud base URL")
+	confluenceUser := flag.String("confluence-user", getEnv("CONFLUENCE_USER", ""), "Confluence user email")
+	confluenceToken := flag.String("confluence-token", getEnv("CONFLUENCE_TOKEN", ""), "Confluence API token")
+	confluenceSpaceKey := flag.String("confluence-space-key", getEnv("CONFLUENCE_SPACE_KEY", "XWIKI"), "Target Confluence space key")
+	confluenceSpaceName := flag.String("confluence-space-name", getEnv("CONFLUENCE_SPACE_NAME", "xWiki Import"), "Target Confluence space name (used when creating)")
 
 	// Mode flags
-	mode := flag.String("mode", "all", "Migration mode: all, export, import")
-	exportDir := flag.String("export-dir", "./export", "Directory for local data storage")
+	mode := flag.String("mode", getEnv("MODE", "all"), "Migration mode: all, export, import")
+	exportDir := flag.String("export-dir", getEnv("EXPORT_DIR", "./export"), "Directory for local data storage")
 
 	// Filter flags
-	skipSpaces := flag.String("skip-spaces", "XWiki", "Comma-separated list of xWiki spaces to skip (internal spaces)")
+	skipSpaces := flag.String("skip-spaces", getEnv("SKIP_SPACES", "XWiki"), "Comma-separated list of xWiki spaces to skip (internal spaces)")
 
 	flag.Parse()
 
-	// Resolve Confluence credentials from env if not set by flags
-	if *confluenceUser == "" {
-		*confluenceUser = os.Getenv("CONFLUENCE_USER")
-	}
 	if *confluenceToken == "" {
-		*confluenceToken = os.Getenv("CONFLUENCE_TOKEN")
-		if *confluenceToken == "" {
-			if data, err := os.ReadFile("API_KEY.txt"); err == nil {
-				*confluenceToken = strings.TrimSpace(string(data))
-			}
+		if data, err := os.ReadFile("API_KEY.txt"); err == nil {
+			*confluenceToken = strings.TrimSpace(string(data))
 		}
 	}
 
@@ -368,4 +366,11 @@ func formatXWikiDate(d interface{}) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
 }
