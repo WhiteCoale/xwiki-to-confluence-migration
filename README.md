@@ -15,13 +15,16 @@ A robust Go-based tool to migrate content from xWiki (v17.x+) to Confluence Clou
 
 ## Setup
 
-1.  **Confluence API Token**: Generate a token at [Atlassian Account](https://id.atlassian.com/manage-profile/security/api-tokens).
-2.  **Environment Variables**: Set the following (optional but recommended):
-    ```powershell
-    $env:CONFLUENCE_USER = "your-email@example.com"
-    $env:CONFLUENCE_TOKEN = "your-api-token"
+1.  **Configuration**: Create a `.env` file in the project root (a template is provided).
+2.  **Edit .env**: Fill in your xWiki and Confluence credentials:
+    ```env
+    XWIKI_URL=http://your-xwiki-host:8080
+    XWIKI_USER=Admin
+    XWIKI_PASSWORD=secret
+    CONFLUENCE_USER=your-email@example.com
+    CONFLUENCE_TOKEN=your-api-token
     ```
-    Alternatively, you can provide these as flags.
+    *Flags will still override .env values if provided.*
 
 ## How to Use (Step-by-Step)
 
@@ -38,16 +41,22 @@ Upload the locally stored data into your Confluence Cloud space.
 go run . --mode import --confluence-url https://your-domain.atlassian.net/wiki --confluence-space-key YOURSPACE
 ```
 
-## Compilation (How to create the EXE)
+## Offline Use (Portable Export)
 
-To create a standalone executable for Windows:
-```bash
-go build -o xwiki-migrate.exe .
-```
-You can then run the tool directly:
-```bash
-./xwiki-migrate.exe --mode all ...
-```
+To run the export on a machine without internet access:
+
+1.  **Build the Tool**: On a machine WITH internet, run `build.bat` or:
+    ```bash
+    go build -mod=vendor -o migration.exe .
+    ```
+2.  **Transfer Files**: Copy the following to the offline machine:
+    - `migration.exe`
+    - `.env` (configured for your local xWiki)
+3.  **Run Export**:
+    ```bash
+    ./migration.exe --mode export
+    ```
+    The tool will use the vendored dependencies included during the build and will not attempt to connect to any external services (except your local xWiki).
 
 ## Folder Detection Logic
 The tool automatically converts xWiki pages to **Native Confluence Folders** if:
