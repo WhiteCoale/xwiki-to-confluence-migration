@@ -5,7 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 )
+
+// xwikiName is the name of the main wiki in a non-farm xWiki installation.
+const xwikiName = "xwiki"
 
 // XWikiClient interacts with the xWiki REST API.
 type XWikiClient struct {
@@ -13,16 +18,84 @@ type XWikiClient struct {
 	Username string
 	Password string
 	Client   *http.Client
+
+	// userNames caches resolved display names; a wiki has far fewer authors
+	// than pages, so every name is looked up only once.
+	userNames map[string]string
 }
 
 // NewXWikiClient creates a new xWiki REST API client.
 func NewXWikiClient(baseURL, username, password string) *XWikiClient {
 	return &XWikiClient{
-		BaseURL:  baseURL,
-		Username: username,
-		Password: password,
-		Client:   &http.Client{},
+		BaseURL:   baseURL,
+		Username:  username,
+		Password:  password,
+		Client:    &http.Client{},
+		userNames: map[string]string{},
 	}
+}
+
+// objectResponse is the xWiki REST representation of a single XObject.
+type objectResponse struct {
+	ClassName  string `json:"className"`
+	Properties []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	} `json:"properties"`
+}
+
+// userRefParts splits a user reference into its space and page name.
+// Accepts "xwiki:XWiki.Admin", "XWiki.Admin" and "Admin".
+func userRefParts(ref string) (space, name string) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", ""
+	}
+	if idx := strings.Index(ref, ":"); idx >= 0 {
+		ref = ref[idx+1:]
+	}
+	if idx := strings.LastIndex(ref, "."); idx >= 0 {
+		return ref[:idx], ref[idx+1:]
+	}
+	return "XWiki", ref
+}
+
+// GetUserDisplayName resolves a user reference to "Vorname Nachname" as stored
+// in the XWiki.XWikiUsers object of the user profile.
+//
+// Falls back to the bare user name when the profile has no name filled in or
+// cannot be read, so a page never loses its authorship information.
+func (c *XWikiClient) GetUserDisplayName(ref string) string {
+	space, name := userRefParts(ref)
+	if name == "" {
+		return ""
+	}
+	if cached, ok := c.userNames[space+"."+name]; ok {
+		return cached
+	}
+
+	display := name
+	body, err := c.doRequest(c.pageEndpoint(space, name) + "/objects/XWiki.XWikiUsers/0")
+	if err == nil {
+		var obj objectResponse
+		if err := json.Unmarshal(body, &obj); err == nil {
+			var first, last string
+			for _, p := range obj.Properties {
+				switch p.Name {
+				case "first_name":
+					first = strings.TrimSpace(p.Value)
+				case "last_name":
+					last = strings.TrimSpace(p.Value)
+				}
+			}
+			if full := strings.TrimSpace(first + " " + last); full != "" {
+				display = full
+			}
+		}
+	}
+
+	c.userNames[space+"."+name] = display
+	return display
 }
 
 // SpacesResponse represents the xWiki REST API response for spaces.
@@ -32,10 +105,10 @@ type SpacesResponse struct {
 
 // SpaceEntry represents a single space in xWiki.
 type SpaceEntry struct {
-	ID   string `json:"id"`
-	Wiki string `json:"wiki"`
-	Name string `json:"name"`
-	Home string `json:"home"`
+	ID               string `json:"id"`
+	Wiki             string `json:"wiki"`
+	Name             string `json:"name"`
+	Home             string `json:"home"`
 	XWikiRelativeURL string `json:"xwikiRelativeUrl"`
 }
 
@@ -46,16 +119,16 @@ type PagesResponse struct {
 
 // PageSummary represents a page summary in the xWiki pages listing.
 type PageSummary struct {
-	ID       string `json:"id"`
-	FullName string `json:"fullName"`
-	Wiki     string `json:"wiki"`
-	Space    string `json:"space"`
-	Name     string `json:"name"`
-	Title    string `json:"title"`
-	RawTitle string `json:"rawTitle"`
-	Parent   string `json:"parent"`
-	ParentID string `json:"parentId"`
-	Syntax   string `json:"syntax"`
+	ID               string `json:"id"`
+	FullName         string `json:"fullName"`
+	Wiki             string `json:"wiki"`
+	Space            string `json:"space"`
+	Name             string `json:"name"`
+	Title            string `json:"title"`
+	RawTitle         string `json:"rawTitle"`
+	Parent           string `json:"parent"`
+	ParentID         string `json:"parentId"`
+	Syntax           string `json:"syntax"`
 	XWikiRelativeURL string `json:"xwikiRelativeUrl"`
 }
 
@@ -97,6 +170,9 @@ type Comment struct {
 	Author string      `json:"author"`
 	Date   interface{} `json:"date"`
 	Text   string      `json:"text"`
+
+	// AuthorName is the resolved "Vorname Nachname", filled in during export.
+	AuthorName string `json:"authorDisplayName,omitempty"`
 }
 
 // HistoryResponse represents the xWiki REST API response for history.
@@ -105,16 +181,21 @@ type HistoryResponse struct {
 }
 
 // HistorySummary represents a single version in xWiki history.
+//
+// The history endpoint names its fields "modifier" and "modified" - not
+// "author"/"date" as the page endpoint does.
 type HistorySummary struct {
-	Version string `json:"version"`
-	Author  string `json:"author"`
-	Date    string `json:"date"`
+	Version  string `json:"version"`
+	Author   string `json:"modifier"`
+	Modified int64  `json:"modified"` // epoch millis
+
+	// AuthorName is the resolved "Vorname Nachname", filled in during export.
+	AuthorName string `json:"authorDisplayName,omitempty"`
 }
 
 // PageDetail represents the full page detail from xWiki.
 func (c *XWikiClient) GetTags(spaceName, pageName string) ([]string, error) {
-	url := fmt.Sprintf("%s/rest/wikis/xwiki/spaces/%s/pages/%s/tags", c.BaseURL, spaceName, pageName)
-	body, err := c.doRequest(url)
+	body, err := c.doRequest(c.pageEndpoint(spaceName, pageName) + "/tags")
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +213,7 @@ func (c *XWikiClient) GetTags(spaceName, pageName string) ([]string, error) {
 }
 
 func (c *XWikiClient) GetComments(spaceName, pageName string) ([]Comment, error) {
-	url := fmt.Sprintf("%s/rest/wikis/xwiki/spaces/%s/pages/%s/comments", c.BaseURL, spaceName, pageName)
-	body, err := c.doRequest(url)
+	body, err := c.doRequest(c.pageEndpoint(spaceName, pageName) + "/comments")
 	if err != nil {
 		return nil, err
 	}
@@ -147,8 +227,7 @@ func (c *XWikiClient) GetComments(spaceName, pageName string) ([]Comment, error)
 }
 
 func (c *XWikiClient) GetHistory(spaceName, pageName string) ([]HistorySummary, error) {
-	url := fmt.Sprintf("%s/rest/wikis/xwiki/spaces/%s/pages/%s/history", c.BaseURL, spaceName, pageName)
-	body, err := c.doRequest(url)
+	body, err := c.doRequest(c.pageEndpoint(spaceName, pageName) + "/history")
 	if err != nil {
 		return nil, err
 	}
@@ -160,19 +239,104 @@ func (c *XWikiClient) GetHistory(spaceName, pageName string) ([]HistorySummary, 
 
 	return resp.HistorySummaries, nil
 }
+
 type PageDetail struct {
-	ID       string `json:"id"`
-	FullName string `json:"fullName"`
-	Wiki     string `json:"wiki"`
-	Space    string `json:"space"`
-	Name     string `json:"name"`
-	Title    string `json:"title"`
-	RawTitle string `json:"rawTitle"`
-	Parent   string `json:"parent"`
-	ParentID string `json:"parentId"`
-	Syntax   string `json:"syntax"`
-	Content  string `json:"content"`
+	ID               string `json:"id"`
+	FullName         string `json:"fullName"`
+	Wiki             string `json:"wiki"`
+	Space            string `json:"space"`
+	Name             string `json:"name"`
+	Title            string `json:"title"`
+	RawTitle         string `json:"rawTitle"`
+	Parent           string `json:"parent"`
+	ParentID         string `json:"parentId"`
+	Syntax           string `json:"syntax"`
+	Content          string `json:"content"`
 	XWikiRelativeURL string `json:"xwikiRelativeUrl"`
+
+	// Authorship and lifecycle metadata. Anforderungen.txt requires these to be
+	// carried over ("owner = last Editor").
+	Version  string `json:"version"`
+	Author   string `json:"author"`   // author of the latest version
+	Creator  string `json:"creator"`  // original creator
+	Modifier string `json:"modifier"` // last editor
+	Created  int64  `json:"created"`  // epoch millis
+	Modified int64  `json:"modified"` // epoch millis
+	Hidden   bool   `json:"hidden"`
+
+	XWikiAbsoluteURL string `json:"xwikiAbsoluteUrl"`
+}
+
+// GetAllPages lists every page of the wiki in a single call, including pages in
+// nested spaces and pages marked as hidden.
+//
+// This replaces walking /spaces: that endpoint only reports the last segment of
+// a nested space name and omits hidden spaces entirely, so both nested and
+// hidden pages were silently dropped.
+func (c *XWikiClient) GetAllPages() ([]PageSummary, error) {
+	all := []PageSummary{}
+	const batch = 500
+
+	for start := 0; ; start += batch {
+		url := fmt.Sprintf("%s/rest/wikis/%s/pages?start=%d&number=%d",
+			c.BaseURL, xwikiName, start, batch)
+		body, err := c.doRequest(url)
+		if err != nil {
+			return nil, err
+		}
+
+		var resp PagesResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("parsing wiki pages response: %w", err)
+		}
+
+		all = append(all, resp.PageSummaries...)
+		if len(resp.PageSummaries) < batch {
+			return all, nil
+		}
+	}
+}
+
+// spacePath turns the dotted space part of a full name ("A.B.C") into the
+// nested REST path segment ("spaces/A/spaces/B/spaces/C").
+func spacePath(space string) string {
+	parts := strings.Split(space, ".")
+	segments := make([]string, 0, len(parts))
+	for _, p := range parts {
+		segments = append(segments, "spaces/"+url.PathEscape(p))
+	}
+	return strings.Join(segments, "/")
+}
+
+// pageEndpoint builds the REST base URL for one page of a (possibly nested) space.
+func (c *XWikiClient) pageEndpoint(space, page string) string {
+	return fmt.Sprintf("%s/rest/wikis/%s/%s/pages/%s",
+		c.BaseURL, xwikiName, spacePath(space), url.PathEscape(page))
+}
+
+// GetRenderedHTML fetches the page as rendered XHTML.
+//
+// The stored source is xWiki 2.1 syntax; rendering it in xWiki itself preserves
+// formatting, colours, macros, tables and image references far more faithfully
+// than re-implementing the syntax parser, which matters for the "moeglichst
+// alle Felder uebernehmen" requirement.
+func (c *XWikiClient) GetRenderedHTML(space, page string) (string, error) {
+	viewPath := make([]string, 0)
+	for _, p := range strings.Split(space, ".") {
+		viewPath = append(viewPath, url.PathEscape(p))
+	}
+	viewPath = append(viewPath, url.PathEscape(page))
+
+	// xpage=plain renders the document body without the skin. Do not add
+	// outputSyntax=plain: that switches the renderer to plain text and strips
+	// every tag, silently losing all formatting.
+	u := fmt.Sprintf("%s/bin/view/%s?xpage=plain", c.BaseURL, strings.Join(viewPath, "/"))
+
+	body, err := c.doRequest(u)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
 }
 
 func (c *XWikiClient) doRequest(url string) ([]byte, error) {
@@ -203,8 +367,7 @@ func (c *XWikiClient) doRequest(url string) ([]byte, error) {
 
 // GetSpaces retrieves all spaces from the xWiki instance.
 func (c *XWikiClient) GetSpaces() ([]SpaceEntry, error) {
-	url := fmt.Sprintf("%s/rest/wikis/xwiki/spaces", c.BaseURL)
-	body, err := c.doRequest(url)
+	body, err := c.doRequest(fmt.Sprintf("%s/rest/wikis/%s/spaces", c.BaseURL, xwikiName))
 	if err != nil {
 		return nil, err
 	}
@@ -219,8 +382,7 @@ func (c *XWikiClient) GetSpaces() ([]SpaceEntry, error) {
 
 // GetPages retrieves all pages in a given space.
 func (c *XWikiClient) GetPages(spaceName string) ([]PageSummary, error) {
-	url := fmt.Sprintf("%s/rest/wikis/xwiki/spaces/%s/pages", c.BaseURL, spaceName)
-	body, err := c.doRequest(url)
+	body, err := c.doRequest(fmt.Sprintf("%s/rest/wikis/%s/%s/pages", c.BaseURL, xwikiName, spacePath(spaceName)))
 	if err != nil {
 		return nil, err
 	}
@@ -235,8 +397,7 @@ func (c *XWikiClient) GetPages(spaceName string) ([]PageSummary, error) {
 
 // GetPageContent retrieves the full content of a page.
 func (c *XWikiClient) GetPageContent(spaceName, pageName string) (*PageDetail, error) {
-	url := fmt.Sprintf("%s/rest/wikis/xwiki/spaces/%s/pages/%s", c.BaseURL, spaceName, pageName)
-	body, err := c.doRequest(url)
+	body, err := c.doRequest(c.pageEndpoint(spaceName, pageName))
 	if err != nil {
 		return nil, err
 	}
@@ -251,8 +412,7 @@ func (c *XWikiClient) GetPageContent(spaceName, pageName string) (*PageDetail, e
 
 // GetAttachments retrieves the list of attachments for a page.
 func (c *XWikiClient) GetAttachments(spaceName, pageName string) ([]Attachment, error) {
-	url := fmt.Sprintf("%s/rest/wikis/xwiki/spaces/%s/pages/%s/attachments", c.BaseURL, spaceName, pageName)
-	body, err := c.doRequest(url)
+	body, err := c.doRequest(c.pageEndpoint(spaceName, pageName) + "/attachments")
 	if err != nil {
 		return nil, err
 	}
@@ -267,6 +427,5 @@ func (c *XWikiClient) GetAttachments(spaceName, pageName string) ([]Attachment, 
 
 // DownloadAttachment downloads the binary content of an attachment.
 func (c *XWikiClient) DownloadAttachment(spaceName, pageName, filename string) ([]byte, error) {
-	url := fmt.Sprintf("%s/rest/wikis/xwiki/spaces/%s/pages/%s/attachments/%s", c.BaseURL, spaceName, pageName, filename)
-	return c.doRequest(url)
+	return c.doRequest(c.pageEndpoint(spaceName, pageName) + "/attachments/" + url.PathEscape(filename))
 }

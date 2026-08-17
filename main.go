@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -22,18 +21,23 @@ func main() {
 	xwikiPassword := flag.String("xwiki-password", getEnv("XWIKI_PASSWORD", "admin"), "xWiki password")
 
 	// Confluence flags
-	confluenceURL := flag.String("confluence-url", getEnv("CONFLUENCE_URL", "https://whitecoale.atlassian.net/wiki"), "Confluence Cloud base URL")
+	confluenceURL := flag.String("confluence-url", getEnv("CONFLUENCE_URL", ""), "Confluence Cloud base URL")
 	confluenceUser := flag.String("confluence-user", getEnv("CONFLUENCE_USER", ""), "Confluence user email")
 	confluenceToken := flag.String("confluence-token", getEnv("CONFLUENCE_TOKEN", ""), "Confluence API token")
-	confluenceSpaceKey := flag.String("confluence-space-key", getEnv("CONFLUENCE_SPACE_KEY", "XWIKI"), "Target Confluence space key")
-	confluenceSpaceName := flag.String("confluence-space-name", getEnv("CONFLUENCE_SPACE_NAME", "xWiki Import"), "Target Confluence space name (used when creating)")
+	confluenceSpaceKey := flag.String("confluence-space-key", getEnv("CONFLUENCE_SPACE_KEY", ""), "Key of the existing target Confluence space")
+	confluenceSpaceName := flag.String("confluence-space-name", getEnv("CONFLUENCE_SPACE_NAME", "xWiki Import"), "Space name, only used together with --create-space")
+	rootPageTitle := flag.String("root-page", getEnv("ROOT_PAGE", "Import"), "Title of the page all content is created below")
+	createSpace := flag.Bool("create-space", getEnvBool("CREATE_SPACE", false), "Create the target space when it does not exist")
 
 	// Mode flags
-	mode := flag.String("mode", getEnv("MODE", "all"), "Migration mode: all, export, import")
+	mode := flag.String("mode", getEnv("MODE", "all"), "Migration mode: all, export, import, report")
 	exportDir := flag.String("export-dir", getEnv("EXPORT_DIR", "./export"), "Directory for local data storage")
+	inputDir := flag.String("input-dir", getEnv("INPUT_DIR", "./input"), "Directory holding the input Excel files")
+	reportPath := flag.String("report", getEnv("REPORT", ""), "Path of the Excel report (default: <export-dir>/migration-report-<timestamp>.xlsx)")
+	statePath := flag.String("state-file", getEnv("STATE_FILE", DefaultStateFile), "File mapping xWiki pages to the created Confluence pages")
 
 	// Filter flags
-	skipSpaces := flag.String("skip-spaces", getEnv("SKIP_SPACES", "XWiki"), "Comma-separated list of xWiki spaces to skip (internal spaces)")
+	skipSpaces := flag.String("skip-spaces", getEnv("SKIP_SPACES", ""), "Comma-separated list of additional xWiki spaces to skip")
 
 	flag.Parse()
 
@@ -43,326 +47,102 @@ func main() {
 		}
 	}
 
-	actualSkipSet := make(map[string]bool)
+	skipSet := make(map[string]bool)
 	for _, s := range strings.Split(*skipSpaces, ",") {
-		s = strings.TrimSpace(s)
-		if s != "" {
-			actualSkipSet[s] = true
+		if s = strings.TrimSpace(s); s != "" {
+			skipSet[s] = true
 		}
 	}
 
-	fmt.Println("=== xWiki to Confluence Migration (2-Step) ===")
-	fmt.Printf("Mode:       %s\n", *mode)
-	fmt.Printf("Export Dir: %s\n", *exportDir)
+	doExport := *mode == "all" || *mode == "export"
+	doImport := *mode == "all" || *mode == "import"
+	doReport := *mode == "all" || *mode == "import" || *mode == "report"
+
+	fmt.Println("=== xWiki nach Confluence Cloud - Migration ===")
+	fmt.Printf("Modus:        %s\n", *mode)
+	fmt.Printf("Export-Ordner: %s\n", *exportDir)
+	fmt.Printf("Eingabe-Ordner: %s\n", *inputDir)
 	fmt.Println()
 
-	if *mode == "all" || *mode == "export" {
+	// The input lists decide what gets migrated; they are read for every mode so
+	// export and report agree on the same data.
+	selection, err := LoadSelection(*inputDir)
+	if err != nil {
+		fmt.Printf("FEHLER beim Lesen der Eingabelisten: %v\n", err)
+		os.Exit(1)
+	}
+	if selection.IsEmpty() {
+		fmt.Printf("Keine Excel-Dateien in %s gefunden - es werden alle Inhaltsseiten migriert.\n\n", *inputDir)
+	} else {
+		fmt.Printf("Eingabelisten: %s (%d Zeilen, %d Seiten)\n\n",
+			strings.Join(selection.Files, ", "), len(selection.Entries), len(selection.ByPage))
+	}
+
+	if doExport {
 		xwiki := NewXWikiClient(*xwikiURL, *xwikiUser, *xwikiPassword)
-		if err := runExport(xwiki, *exportDir, actualSkipSet); err != nil {
-			fmt.Printf("ERROR during export: %v\n", err)
+		if err := runExport(xwiki, *exportDir, skipSet); err != nil {
+			fmt.Printf("FEHLER beim Export: %v\n", err)
 			os.Exit(1)
 		}
+		fmt.Println()
 	}
 
-	if *mode == "all" || *mode == "import" {
-		if *confluenceUser == "" || *confluenceToken == "" {
-			fmt.Println("ERROR: Confluence credentials required for import.")
-			os.Exit(1)
-		}
-		confluence := NewConfluenceClient(*confluenceURL, *confluenceUser, *confluenceToken)
-		if err := runImport(confluence, *exportDir, *confluenceSpaceKey, *confluenceSpaceName); err != nil {
-			fmt.Printf("ERROR during import: %v\n", err)
-			os.Exit(1)
-		}
-	}
-}
-
-// ExportPage represents the metadata for a page saved locally.
-type ExportPage struct {
-	XWikiID     string           `json:"xwiki_id"`
-	Name        string           `json:"name"`
-	Title       string           `json:"title"`
-	Parent      string           `json:"parent"`
-	Tags        []string         `json:"tags"`
-	Comments    []Comment        `json:"comments"`
-	History     []HistorySummary `json:"history"`
-	Attachments []string         `json:"attachments"`
-}
-
-func runExport(xwiki *XWikiClient, exportDir string, skipSet map[string]bool) error {
-	fmt.Println("[1/2] Step 1: Exporting from xWiki to local storage...")
-
-	if err := os.MkdirAll(exportDir, 0755); err != nil {
-		return err
-	}
-
-	spaces, err := xwiki.GetSpaces()
+	index, err := LoadExportIndex(*exportDir)
 	if err != nil {
-		return err
+		fmt.Printf("FEHLER: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Save space list
-	spaceJSON, _ := json.MarshalIndent(spaces, "", "  ")
-	_ = os.WriteFile(filepath.Join(exportDir, "spaces.json"), spaceJSON, 0644)
-
-	for _, space := range spaces {
-		if skipSet[space.Name] {
-			fmt.Printf("  Skipping space: %s\n", space.Name)
-			continue
+	var results []MigrationResult
+	if doImport {
+		if *confluenceUser == "" || *confluenceToken == "" || *confluenceURL == "" {
+			fmt.Println("FEHLER: CONFLUENCE_URL, CONFLUENCE_USER und CONFLUENCE_TOKEN werden fuer den Import benoetigt.")
+			os.Exit(1)
+		}
+		if *confluenceSpaceKey == "" {
+			fmt.Println("FEHLER: CONFLUENCE_SPACE_KEY (Key des bestehenden Ziel-Space) fehlt.")
+			os.Exit(1)
 		}
 
-		fmt.Printf("  Processing Space: %s\n", space.Name)
-		spacePath := filepath.Join(exportDir, space.Name)
-		if err := os.MkdirAll(filepath.Join(spacePath, "pages"), 0755); err != nil {
-			return err
-		}
-
-		pages, err := xwiki.GetPages(space.Name)
+		conf := NewConfluenceClient(*confluenceURL, *confluenceUser, *confluenceToken)
+		results, err = runImport(conf, index, selection, *exportDir, *statePath,
+			*confluenceSpaceKey, *confluenceSpaceName, *rootPageTitle, *createSpace)
 		if err != nil {
-			fmt.Printf("    Error fetching pages: %v\n", err)
-			continue
+			fmt.Printf("FEHLER beim Import: %v\n", err)
+			os.Exit(1)
 		}
+		fmt.Println()
+	} else if doReport {
+		// Report without import: show what would happen.
+		_, results = buildPlan(index, selection)
+	}
 
-		// Save page list for the space
-		pagesJSON, _ := json.MarshalIndent(pages, "", "  ")
-		_ = os.WriteFile(filepath.Join(spacePath, "pages.json"), pagesJSON, 0644)
-
-		for _, pSummary := range pages {
-			pageName := pSummary.Name
-			fmt.Printf("    Exporting Page: %s ... ", pageName)
-
-			pageDetail, err := xwiki.GetPageContent(space.Name, pageName)
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				continue
-			}
-
-			tags, _ := xwiki.GetTags(space.Name, pageName)
-			comments, _ := xwiki.GetComments(space.Name, pageName)
-			history, _ := xwiki.GetHistory(space.Name, pageName)
-			attachments, _ := xwiki.GetAttachments(space.Name, pageName)
-
-			safeName := sanitizeFilename(pageName)
-			pageDir := filepath.Join(spacePath, "pages", safeName)
-			if err := os.MkdirAll(filepath.Join(pageDir, "attachments"), 0755); err != nil {
-				return err
-			}
-
-			// Content
-			_ = os.WriteFile(filepath.Join(pageDir, "content.html"), []byte(pageDetail.Content), 0644)
-
-			// Metadata
-			meta := ExportPage{
-				XWikiID:  fmt.Sprintf("%s.%s", space.Name, pageName),
-				Name:     pageName,
-				Title:    pageDetail.Title,
-				Parent:   pageDetail.Parent,
-				Tags:     tags,
-				Comments: comments,
-				History:  history,
-			}
-
-			for _, att := range attachments {
-				meta.Attachments = append(meta.Attachments, att.Name)
-				data, err := xwiki.DownloadAttachment(space.Name, pageName, att.Name)
-				if err == nil {
-					_ = os.WriteFile(filepath.Join(pageDir, "attachments", att.Name), data, 0644)
-				}
-			}
-
-			metaJSON, _ := json.MarshalIndent(meta, "", "  ")
-			_ = os.WriteFile(filepath.Join(pageDir, "metadata.json"), metaJSON, 0644)
-
-			fmt.Println("OK")
+	if doReport {
+		path := *reportPath
+		if path == "" {
+			path = filepath.Join(*exportDir,
+				fmt.Sprintf("migration-report-%s.xlsx", time.Now().Format("2006-01-02-1504")))
+		}
+		if err := WriteReport(path, results, selection); err != nil {
+			fmt.Printf("FEHLER beim Report: %v\n", err)
+			os.Exit(1)
 		}
 	}
 
-	fmt.Println("  Export finished successfully.")
-	return nil
-}
-
-func runImport(confluence *ConfluenceClient, exportDir, targetSpaceKey, targetSpaceName string) error {
-	fmt.Println("[2/2] Step 2: Importing from local storage to Confluence...")
-
-	// 1. Setup space
-	space, err := confluence.GetOrCreateSpace(targetSpaceKey, targetSpaceName)
-	if err != nil {
-		return err
-	}
-
-	// 2. Iterate spaces in export dir
-	entries, err := os.ReadDir(exportDir)
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		spaceName := entry.Name()
-		spacePath := filepath.Join(exportDir, spaceName)
-
-		// Check if it's a valid space export
-		if _, err := os.Stat(filepath.Join(spacePath, "pages.json")); err != nil {
-			continue
-		}
-
-		fmt.Printf("  Importing Space: %s\n", spaceName)
-
-		// Read page summaries to know what exists
-		var pages []PageSummary
-		data, _ := os.ReadFile(filepath.Join(spacePath, "pages.json"))
-		json.Unmarshal(data, &pages)
-
-		xwikiToConfluenceID := make(map[string]string)
-		isFolderMap := make(map[string]bool)
-
-		// Recursive import function
-		var importPage func(string) string
-		importPage = func(pageName string) string {
-			xwikiFullName := fmt.Sprintf("xwiki:%s.%s", spaceName, pageName)
-			if id, exists := xwikiToConfluenceID[xwikiFullName]; exists {
-				return id
-			}
-
-			safeName := sanitizeFilename(pageName)
-			pageDir := filepath.Join(spacePath, "pages", safeName)
-
-			var meta ExportPage
-			metaData, err := os.ReadFile(filepath.Join(pageDir, "metadata.json"))
-			if err != nil {
-				return ""
-			}
-			json.Unmarshal(metaData, &meta)
-
-			content, _ := os.ReadFile(filepath.Join(pageDir, "content.html"))
-
-			fmt.Printf("    Importing Page: %s ... ", pageName)
-
-			// Handle Parent
-			parentID := ""
-			parentFullName := ""
-			if meta.Parent != "" {
-				parentRef := meta.Parent
-				if !strings.Contains(parentRef, ":") && !strings.Contains(parentRef, ".") {
-					parentRef = spaceName + "." + parentRef
-				}
-				parentFullName = "xwiki:" + strings.TrimPrefix(parentRef, "xwiki:")
-				parts := strings.Split(strings.TrimPrefix(parentRef, "xwiki:"), ".")
-				if len(parts) == 2 {
-					pSpace, pPage := parts[0], parts[1]
-					if pSpace == spaceName && pPage != pageName {
-						parentID = importPage(pPage)
-					}
-				}
-			}
-
-			// Folder Detection
-			shouldBeFolder := strings.Contains(strings.ToLower(meta.Title), "folder") || 
-							  strings.Contains(strings.ToLower(meta.Title), "ordner") ||
-							  strings.HasPrefix(meta.Name, "Folder") ||
-							  pageName == "WebHome"
-
-			pageTitle := fmt.Sprintf("%s - %s", strings.ToUpper(spaceName), meta.Title)
-			if meta.Title == "" {
-				pageTitle = fmt.Sprintf("%s - %s", strings.ToUpper(spaceName), meta.Name)
-			}
-
-			var confluenceID string
-			if shouldBeFolder {
-				fmt.Printf(" (FOLDER) ...")
-				folderID, err := confluence.CreateFolder(space.ID.String(), pageTitle, parentID)
-				if err != nil {
-					fmt.Printf(" FAILED: %v (falling back to page) ...", err)
-					shouldBeFolder = false
-				} else {
-					confluenceID = folderID
-					isFolderMap[xwikiFullName] = true
-				}
-			}
-
-			if !shouldBeFolder {
-				confluenceBody := ConvertXWikiToConfluenceStorage(string(content))
-				if len(meta.History) > 1 {
-					confluenceBody += "<hr/><p><strong>Revision History (from xWiki):</strong></p><ul>"
-					for _, h := range meta.History {
-						confluenceBody += fmt.Sprintf("<li>v%s - %s (%s)</li>", h.Version, formatXWikiDate(h.Date), h.Author)
-					}
-					confluenceBody += "</ul>"
-				}
-
-				actualParent := parentID
-				if parentFullName != "" && isFolderMap[parentFullName] {
-					actualParent = "" 
-				}
-
-				created, err := confluence.CreatePage(space.ID.String(), pageTitle, confluenceBody, actualParent)
-				if err != nil {
-					fmt.Printf(" ERROR: %v\n", err)
-					return ""
-				}
-				confluenceID = created.ID
-
-				if parentFullName != "" && isFolderMap[parentFullName] {
-					fmt.Printf(" (MOVING) ...")
-					_ = confluence.MovePageToFolder(confluenceID, created.Version.Number, pageTitle, parentID)
-				}
-
-				// Metadata
-				for _, tag := range meta.Tags {
-					_ = confluence.AddLabel(confluenceID, tag)
-				}
-				for _, comm := range meta.Comments {
-					commBody := fmt.Sprintf("<p><strong>%s (%s):</strong></p><p>%s</p>", comm.Author, formatXWikiDate(comm.Date), comm.Text)
-					_ = confluence.AddComment(confluenceID, commBody)
-				}
-				for _, attName := range meta.Attachments {
-					attData, err := os.ReadFile(filepath.Join(pageDir, "attachments", attName))
-					if err == nil {
-						_ = confluence.UploadAttachment(confluenceID, attName, attData)
-					}
-				}
-			}
-
-			fmt.Println("OK")
-			xwikiToConfluenceID[xwikiFullName] = confluenceID
-			return confluenceID
-		}
-
-		for _, p := range pages {
-			if p.Name != "WebHome" {
-				importPage(p.Name)
-			} else {
-				// Ensure WebHome is imported first if it's the root
-				importPage("WebHome")
-			}
-		}
-	}
-
-	fmt.Println("  Import finished successfully.")
-	return nil
-}
-
-func sanitizeFilename(name string) string {
-	return strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, name)
+	fmt.Println("\nFertig.")
 }
 
 func formatXWikiDate(d interface{}) string {
 	if d == nil {
-		return "unknown date"
+		return "unbekannt"
 	}
 	switch v := d.(type) {
 	case string:
 		return v
 	case float64:
-		t := time.UnixMilli(int64(v))
-		return t.Format("2006-01-02 15:04:05")
+		return time.UnixMilli(int64(v)).Format("2006-01-02 15:04:05")
+	case int64:
+		return time.UnixMilli(v).Format("2006-01-02 15:04:05")
 	default:
 		return fmt.Sprintf("%v", v)
 	}
@@ -371,6 +151,18 @@ func formatXWikiDate(d interface{}) string {
 func getEnv(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
+	}
+	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	if value, ok := os.LookupEnv(key); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "ja":
+			return true
+		case "0", "false", "no", "nein":
+			return false
+		}
 	}
 	return fallback
 }

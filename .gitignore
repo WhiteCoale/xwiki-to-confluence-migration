@@ -4,3 +4,8 @@ export/
 API_KEY.txt
 ndebug_*
 Anweisung.txt
+migration-state.json
+input/~$*
+Anforderungen.txt
+input/
+*.xlsx

@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	neturl "net/url"
 	"strings"
 )
 
@@ -56,16 +57,26 @@ type ConfluencePage struct {
 	ID      string            `json:"id,omitempty"`
 	Title   string            `json:"title"`
 	Status  string            `json:"status"`
+	SpaceID string            `json:"spaceId,omitempty"`
 	Version ConfluenceVersion `json:"version,omitempty"`
+	Links   ConfluenceLinks   `json:"_links"`
+}
+
+// pagesPage is one page of the paginated GET /pages result.
+type pagesPage struct {
+	Results []ConfluencePage `json:"results"`
+	Links   struct {
+		Next string `json:"next"`
+	} `json:"_links"`
 }
 
 // CreatePageRequest is the body for POST /wiki/api/v2/pages.
 type CreatePageRequest struct {
-	SpaceID  string          `json:"spaceId"`
-	Status   string          `json:"status"`
-	Title    string          `json:"title"`
-	ParentID string          `json:"parentId,omitempty"`
-	Body     CreatePageBody  `json:"body"`
+	SpaceID  string         `json:"spaceId"`
+	Status   string         `json:"status"`
+	Title    string         `json:"title"`
+	ParentID string         `json:"parentId,omitempty"`
+	Body     CreatePageBody `json:"body"`
 }
 
 // CreatePageBody contains the page body content.
@@ -80,6 +91,17 @@ type CreatePageResponse struct {
 	Title   string            `json:"title"`
 	Status  string            `json:"status"`
 	Version ConfluenceVersion `json:"version"`
+	Links   ConfluenceLinks   `json:"_links"`
+
+	// Existing is set when the page was already present and was reused rather
+	// than created.
+	Existing bool `json:"-"`
+}
+
+// ConfluenceLinks carries the web UI path of a page.
+type ConfluenceLinks struct {
+	WebUI string `json:"webui"`
+	Base  string `json:"base"`
 }
 
 // CreateSpaceRequest is the body for POST /wiki/api/v2/spaces.
@@ -211,7 +233,8 @@ func (c *ConfluenceClient) GetOrCreateSpace(key, name string) (*ConfluenceSpace,
 
 // GetPageByTitle looks up a Confluence page by its title in a specific space.
 func (c *ConfluenceClient) GetPageByTitle(spaceID, title string) (*ConfluencePage, error) {
-	url := fmt.Sprintf("%s/api/v2/pages?spaceId=%s&title=%s", c.BaseURL, spaceID, strings.ReplaceAll(title, " ", "%20"))
+	url := fmt.Sprintf("%s/api/v2/pages?spaceId=%s&title=%s",
+		c.BaseURL, spaceID, neturl.QueryEscape(title))
 	body, status, err := c.doRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -226,11 +249,16 @@ func (c *ConfluenceClient) GetPageByTitle(spaceID, title string) (*ConfluencePag
 		return nil, fmt.Errorf("parsing pages search response: %w", err)
 	}
 
-	if len(resp.Results) == 0 {
-		return nil, nil // page not found
+	// The spaceId query parameter is not honoured reliably: the endpoint also
+	// returns same-titled pages from other spaces. Filter here, otherwise a
+	// page from an unrelated space would be adopted as the target.
+	for i := range resp.Results {
+		if resp.Results[i].SpaceID == spaceID {
+			return &resp.Results[i], nil
+		}
 	}
 
-	return &resp.Results[0], nil
+	return nil, nil // page not found in this space
 }
 
 // CreatePage creates a new page in Confluence.
@@ -242,10 +270,12 @@ func (c *ConfluenceClient) CreatePage(spaceID, title, storageFormatBody, parentI
 	}
 	if existing != nil {
 		return &CreatePageResponse{
-			ID:      existing.ID,
-			Title:   existing.Title,
-			Status:  existing.Status,
-			Version: existing.Version,
+			ID:       existing.ID,
+			Title:    existing.Title,
+			Status:   existing.Status,
+			Version:  existing.Version,
+			Links:    existing.Links,
+			Existing: true,
 		}, nil
 	}
 
@@ -280,10 +310,45 @@ func (c *ConfluenceClient) CreatePage(spaceID, title, storageFormatBody, parentI
 	return &page, nil
 }
 
-// UploadAttachment uploads a file attachment to a Confluence page.
+// attachmentListResponse is the V1 response when looking up an attachment.
+type attachmentListResponse struct {
+	Results []struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+	} `json:"results"`
+}
+
+// findAttachmentID returns the ID of an existing attachment with that filename.
+func (c *ConfluenceClient) findAttachmentID(pageID, filename string) string {
+	url := fmt.Sprintf("%s/rest/api/content/%s/child/attachment?filename=%s",
+		c.BaseURL, pageID, neturl.QueryEscape(filename))
+	body, status, err := c.doRequest("GET", url, nil)
+	if err != nil || status != http.StatusOK {
+		return ""
+	}
+
+	var resp attachmentListResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return ""
+	}
+	for _, a := range resp.Results {
+		if a.Title == filename {
+			return a.ID
+		}
+	}
+	return ""
+}
+
+// UploadAttachment uploads a file attachment to a Confluence page. An
+// attachment that is already present is replaced with a new version, because
+// Confluence rejects a second upload under the same name.
 func (c *ConfluenceClient) UploadAttachment(pageID, filename string, data []byte) error {
 	// Use V1 API for attachments as V2 can be unreliable for this specific operation
 	url := fmt.Sprintf("%s/rest/api/content/%s/child/attachment", c.BaseURL, pageID)
+	if existingID := c.findAttachmentID(pageID, filename); existingID != "" {
+		url = fmt.Sprintf("%s/rest/api/content/%s/child/attachment/%s/data",
+			c.BaseURL, pageID, existingID)
+	}
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
@@ -295,7 +360,7 @@ func (c *ConfluenceClient) UploadAttachment(pageID, filename string, data []byte
 	if _, err := part.Write(data); err != nil {
 		return fmt.Errorf("writing data to part: %w", err)
 	}
-	
+
 	// Add comment if needed (optional)
 	// _ = writer.WriteField("comment", "Migrated from xWiki")
 
@@ -346,6 +411,51 @@ func (c *ConfluenceClient) AddLabel(pageID, label string) error {
 	return nil
 }
 
+// footerCommentsResponse is the V2 response for a page's footer comments.
+type footerCommentsResponse struct {
+	Results []struct {
+		Body struct {
+			Storage struct {
+				Value string `json:"value"`
+			} `json:"storage"`
+		} `json:"body"`
+	} `json:"results"`
+}
+
+// ListFooterCommentBodies returns the storage bodies of a page's comments. It
+// lets the import skip comments it already migrated, so repeated runs do not
+// pile up duplicates.
+func (c *ConfluenceClient) ListFooterCommentBodies(pageID string) (map[string]bool, error) {
+	url := fmt.Sprintf("%s/api/v2/pages/%s/footer-comments?body-format=storage&limit=250",
+		c.BaseURL, pageID)
+	body, status, err := c.doRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d listing comments of page %s", status, pageID)
+	}
+
+	var resp footerCommentsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+
+	bodies := make(map[string]bool, len(resp.Results))
+	for _, r := range resp.Results {
+		bodies[normalizeCommentBody(r.Body.Storage.Value)] = true
+	}
+	return bodies, nil
+}
+
+// normalizeCommentBody removes the formatting differences Confluence
+// introduces when storing a comment, so comparisons stay reliable.
+func normalizeCommentBody(body string) string {
+	body = strings.ReplaceAll(body, "&nbsp;", " ")
+	body = strings.ReplaceAll(body, " ", " ")
+	return strings.Join(strings.Fields(body), " ")
+}
+
 // AddComment adds a footer comment to a Confluence page.
 func (c *ConfluenceClient) AddComment(pageID, body string) error {
 	// Using V1 API for comments
@@ -369,6 +479,185 @@ func (c *ConfluenceClient) AddComment(pageID, body string) error {
 	}
 	if status != http.StatusOK && status != http.StatusCreated {
 		return fmt.Errorf("unexpected status %d adding comment to page %s", status, pageID)
+	}
+	return nil
+}
+
+// GetOrCreatePage returns the page with the given title, creating it when it
+// does not exist yet. Used for the "Import" root page.
+func (c *ConfluenceClient) GetOrCreatePage(spaceID, title, body, parentID string) (*CreatePageResponse, error) {
+	return c.CreatePage(spaceID, title, body, parentID)
+}
+
+// UpdatePage replaces the body of an existing page, bumping its version.
+func (c *ConfluenceClient) UpdatePage(pageID, title, storageBody string, currentVersion int, parentID string) error {
+	url := fmt.Sprintf("%s/api/v2/pages/%s", c.BaseURL, pageID)
+	req := map[string]interface{}{
+		"id":     pageID,
+		"status": "current",
+		"title":  title,
+		"body": map[string]interface{}{
+			"representation": "storage",
+			"value":          storageBody,
+		},
+		"version": map[string]interface{}{
+			"number":  currentVersion + 1,
+			"message": "xWiki-Migration aktualisiert",
+		},
+	}
+	if parentID != "" {
+		req["parentId"] = parentID
+	}
+
+	body, status, err := c.doRequest("PUT", url, req)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("unexpected status %d updating page %s: %s", status, pageID, string(body))
+	}
+	return nil
+}
+
+// siteBase strips the "/wiki" suffix so that relative API links can be resolved.
+func (c *ConfluenceClient) siteBase() string {
+	if parsed, err := neturl.Parse(c.BaseURL); err == nil && parsed.Host != "" {
+		return parsed.Scheme + "://" + parsed.Host
+	}
+	return c.BaseURL
+}
+
+// PageURL builds the browser URL of a created page.
+func (c *ConfluenceClient) PageURL(page *CreatePageResponse) string {
+	if page == nil {
+		return ""
+	}
+	if page.Links.WebUI != "" {
+		return strings.TrimSuffix(c.BaseURL, "/") + page.Links.WebUI
+	}
+	return fmt.Sprintf("%s/pages/viewpage.action?pageId=%s", strings.TrimSuffix(c.BaseURL, "/"), page.ID)
+}
+
+// userSearchResult is the shape of GET /rest/api/search/user.
+type userSearchResult struct {
+	Results []struct {
+		User struct {
+			AccountID   string `json:"accountId"`
+			Email       string `json:"email"`
+			DisplayName string `json:"displayName"`
+		} `json:"user"`
+	} `json:"results"`
+}
+
+// FindAccountIDByName resolves an xWiki user name or e-mail to a Confluence
+// account ID. It returns an empty string when there is no match, which is the
+// normal case for users that do not exist in the Cloud site.
+func (c *ConfluenceClient) FindAccountIDByName(name string) (string, error) {
+	query := strings.TrimSpace(name)
+	if query == "" {
+		return "", nil
+	}
+
+	field := "user.fullname"
+	if strings.Contains(query, "@") {
+		field = "user.email"
+	}
+	cql := fmt.Sprintf(`%s~"%s"`, field, strings.ReplaceAll(query, `"`, ""))
+	url := fmt.Sprintf("%s/rest/api/search/user?cql=%s&limit=1", c.BaseURL, neturl.QueryEscape(cql))
+
+	body, status, err := c.doRequest("GET", url, nil)
+	if err != nil || status != http.StatusOK {
+		return "", err
+	}
+
+	var resp userSearchResult
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", err
+	}
+	if len(resp.Results) == 0 {
+		return "", nil
+	}
+	return resp.Results[0].User.AccountID, nil
+}
+
+// SpacePage is one existing page of the target space together with its labels.
+type SpacePage struct {
+	ID     string
+	Title  string
+	Labels []string
+}
+
+// contentListResponse is the shape of GET /rest/api/content.
+type contentListResponse struct {
+	Results []struct {
+		ID       string `json:"id"`
+		Title    string `json:"title"`
+		Metadata struct {
+			Labels struct {
+				Results []struct {
+					Name string `json:"name"`
+				} `json:"results"`
+			} `json:"labels"`
+		} `json:"metadata"`
+	} `json:"results"`
+	Links struct {
+		Next string `json:"next"`
+	} `json:"_links"`
+}
+
+// ListSpacePages returns every page of a space with its labels.
+//
+// This uses the V1 content endpoint rather than a CQL search on purpose: search
+// runs against an index that lags behind writes by minutes, so a migration
+// re-run would not see the pages it had just created.
+func (c *ConfluenceClient) ListSpacePages(spaceKey string) ([]SpacePage, error) {
+	var pages []SpacePage
+	url := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&type=page&expand=metadata.labels&limit=200",
+		c.BaseURL, neturl.QueryEscape(spaceKey))
+
+	for url != "" {
+		body, status, err := c.doRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		if status != http.StatusOK {
+			return nil, fmt.Errorf("unexpected status %d listing content of space %s: %s",
+				status, spaceKey, string(body))
+		}
+
+		var resp contentListResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("parsing content list response: %w", err)
+		}
+
+		for _, r := range resp.Results {
+			page := SpacePage{ID: r.ID, Title: r.Title}
+			for _, l := range r.Metadata.Labels.Results {
+				page.Labels = append(page.Labels, l.Name)
+			}
+			pages = append(pages, page)
+		}
+
+		if resp.Links.Next == "" {
+			break
+		}
+		url = strings.TrimSuffix(c.siteBase(), "/") + resp.Links.Next
+	}
+
+	return pages, nil
+}
+
+// SetPageOwner assigns the page owner, which is the closest Confluence Cloud
+// equivalent of the xWiki last editor. Confluence always records the API user
+// as the version author, so this is best effort.
+func (c *ConfluenceClient) SetPageOwner(pageID, accountID string) error {
+	url := fmt.Sprintf("%s/api/v2/pages/%s/owner", c.BaseURL, pageID)
+	_, status, err := c.doRequest("PUT", url, map[string]string{"accountId": accountID})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK && status != http.StatusNoContent {
+		return fmt.Errorf("unexpected status %d setting owner of page %s", status, pageID)
 	}
 	return nil
 }
