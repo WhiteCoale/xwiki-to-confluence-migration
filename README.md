@@ -85,9 +85,9 @@ ab – mit `--create-space` legt es ihn an.
 
 ## Setup
 
-1. `.env` im Projektverzeichnis anlegen:
+1. `.env` neben der `migration.exe` anlegen:
    ```env
-   XWIKI_URL=http://your-xwiki-host:8080
+   XWIKI_URL=https://your-xwiki-host/xwiki
    XWIKI_USER=Admin
    XWIKI_PASSWORD=secret
 
@@ -101,12 +101,39 @@ ab – mit `--create-space` legt es ihn an.
    (`/wiki/spaces/<KEY>/overview`), nicht der Anzeigename.
 2. Flags überschreiben `.env`-Werte.
 
+### XWIKI_URL richtig setzen
+
+xWiki laeuft fast immer unter einem **Kontextpfad**, meist `/xwiki`. Dieser Teil
+gehoert mit in `XWIKI_URL`, sonst antwortet der Webserver mit `404 Not Found`:
+
+```
+richtig:  XWIKI_URL=https://wiki.example.com/xwiki
+falsch:   XWIKI_URL=https://wiki.example.com
+```
+
+Zum Pruefen diese Adresse im Browser oeffnen – sie muss eine Liste der Wikis
+liefern, keinen 404:
+
+```
+https://wiki.example.com/xwiki/rest/wikis
+```
+
+Heisst das Wiki dort nicht `xwiki` (z. B. in einer Wiki-Farm), den Namen mit
+`--xwiki-name` bzw. `XWIKI_NAME` setzen. Das Tool prueft beides vor dem Export
+und nennt im Fehlerfall die vorhandenen Wiki-Namen.
+
+### Eingabeordner
+
+Den Ordner `input` neben der `migration.exe` anlegen und die Excel-Dateien
+hineinlegen. Fehlt er, meldet das Tool `Keine Excel-Dateien in ./input gefunden`
+und migriert **alle** Inhaltsseiten.
+
 ## Ablauf
 
 ### Schritt 1: Export (offline-fähig)
 
 ```bash
-./migration.exe --mode export
+migration.exe --mode export
 ```
 
 Erzeugt `./export` mit `index.json` und je Seite einen Ordner mit
@@ -116,7 +143,7 @@ und `attachments/`.
 ### Schritt 2 + 3: Import und Report
 
 ```bash
-./migration.exe --mode import
+migration.exe --mode import
 ```
 
 Der Import schreibt `migration-state.json` mit der Zuordnung xWiki-Seite →
@@ -131,7 +158,7 @@ und die Zuordnung neu aufbaut. Im Anschluss entsteht automatisch der Report.
 Nur den Report (zeigt ohne Confluence-Zugriff, was passieren würde):
 
 ```bash
-./migration.exe --mode report
+migration.exe --mode report
 ```
 
 ### Report
@@ -156,7 +183,7 @@ wird zum Ausfuehren also nicht benoetigt.
    ```
    (oder `build.bat`)
 2. `migration.exe` und `.env` auf die Offline-Maschine kopieren.
-3. Dort `./migration.exe --mode export` ausführen. Es werden nur die vendorten
+3. Dort `migration.exe --mode export` ausführen. Es werden nur die vendorten
    Abhängigkeiten genutzt; außer dem lokalen xWiki wird nichts kontaktiert.
 
 ## Testdaten
@@ -173,7 +200,8 @@ und passende Eingabe-Excel-Dateien befüllen – siehe
 | `--export-dir` | Lokale Ablage | `./export` |
 | `--input-dir` | Ordner mit den Eingabe-Excel-Dateien | `./input` |
 | `--report` | Pfad des Reports | `<export-dir>/migration-report-<zeit>.xlsx` |
-| `--xwiki-url` | Basis-URL des xWiki | `http://localhost:8080` |
+| `--xwiki-url` | Basis-URL des xWiki **inkl. Kontextpfad** | `http://localhost:8080` |
+| `--xwiki-name` | Name des Wikis in der Instanz | `xwiki` |
 | `--confluence-space-key` | Key des bestehenden Ziel-Space | – |
 | `--root-page` | Seite, unter der importiert wird | `Import` |
 | `--create-space` | Ziel-Space anlegen, falls nicht vorhanden | `false` |

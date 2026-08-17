@@ -17,6 +17,7 @@ func main() {
 
 	// xWiki flags
 	xwikiURL := flag.String("xwiki-url", getEnv("XWIKI_URL", "http://localhost:8080"), "xWiki base URL")
+	xwikiWiki := flag.String("xwiki-name", getEnv("XWIKI_NAME", "xwiki"), "Name of the wiki inside the xWiki instance")
 	xwikiUser := flag.String("xwiki-user", getEnv("XWIKI_USER", "Admin"), "xWiki username")
 	xwikiPassword := flag.String("xwiki-password", getEnv("XWIKI_PASSWORD", "admin"), "xWiki password")
 
@@ -79,7 +80,11 @@ func main() {
 	}
 
 	if doExport {
-		xwiki := NewXWikiClient(*xwikiURL, *xwikiUser, *xwikiPassword)
+		xwiki := NewXWikiClient(*xwikiURL, *xwikiWiki, *xwikiUser, *xwikiPassword)
+		if err := xwiki.Verify(); err != nil {
+			fmt.Printf("FEHLER: %v\n", err)
+			os.Exit(1)
+		}
 		if err := runExport(xwiki, *exportDir, skipSet); err != nil {
 			fmt.Printf("FEHLER beim Export: %v\n", err)
 			os.Exit(1)

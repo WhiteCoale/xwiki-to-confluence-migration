@@ -9,12 +9,13 @@ import (
 	"strings"
 )
 
-// xwikiName is the name of the main wiki in a non-farm xWiki installation.
-const xwikiName = "xwiki"
+// defaultWikiName is the name of the main wiki in a standard installation.
+const defaultWikiName = "xwiki"
 
 // XWikiClient interacts with the xWiki REST API.
 type XWikiClient struct {
 	BaseURL  string
+	WikiName string
 	Username string
 	Password string
 	Client   *http.Client
@@ -25,14 +26,66 @@ type XWikiClient struct {
 }
 
 // NewXWikiClient creates a new xWiki REST API client.
-func NewXWikiClient(baseURL, username, password string) *XWikiClient {
+func NewXWikiClient(baseURL, wikiName, username, password string) *XWikiClient {
+	if wikiName == "" {
+		wikiName = defaultWikiName
+	}
 	return &XWikiClient{
-		BaseURL:   baseURL,
+		// A trailing slash would produce "//rest/..." further down.
+		BaseURL:   strings.TrimRight(baseURL, "/"),
+		WikiName:  wikiName,
 		Username:  username,
 		Password:  password,
 		Client:    &http.Client{},
 		userNames: map[string]string{},
 	}
+}
+
+// WikisResponse is the xWiki REST response listing the wikis of an instance.
+type WikisResponse struct {
+	Wikis []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"wikis"`
+}
+
+// Verify checks that the REST API answers under the configured base URL and
+// that the configured wiki exists.
+//
+// Both mistakes are easy to make and produce a bare 404 otherwise: xWiki is
+// usually deployed under a context path (".../xwiki"), and in a wiki farm the
+// main wiki may not be called "xwiki".
+func (c *XWikiClient) Verify() error {
+	body, err := c.doRequest(c.BaseURL + "/rest/wikis")
+	if err != nil {
+		return fmt.Errorf("xWiki-REST-API unter %s/rest nicht erreichbar.\n"+
+			"    Haeufigste Ursache: der Kontextpfad fehlt in XWIKI_URL.\n"+
+			"    Beispiel: XWIKI_URL=https://host.example.com/xwiki "+
+			"(statt nur https://host.example.com)\n"+
+			"    Zum Pruefen im Browser oeffnen: %s/rest/wikis\n"+
+			"    Details: %w", c.BaseURL, c.BaseURL, err)
+	}
+
+	var resp WikisResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("unerwartete Antwort von %s/rest/wikis: %w", c.BaseURL, err)
+	}
+
+	names := make([]string, 0, len(resp.Wikis))
+	for _, w := range resp.Wikis {
+		name := w.Name
+		if name == "" {
+			name = w.ID
+		}
+		names = append(names, name)
+		if name == c.WikiName {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("Wiki %q existiert nicht auf %s. Vorhanden: %s\n"+
+		"    Passenden Namen mit --xwiki-name bzw. XWIKI_NAME setzen.",
+		c.WikiName, c.BaseURL, strings.Join(names, ", "))
 }
 
 // objectResponse is the xWiki REST representation of a single XObject.
@@ -279,7 +332,7 @@ func (c *XWikiClient) GetAllPages() ([]PageSummary, error) {
 
 	for start := 0; ; start += batch {
 		url := fmt.Sprintf("%s/rest/wikis/%s/pages?start=%d&number=%d",
-			c.BaseURL, xwikiName, start, batch)
+			c.BaseURL, c.WikiName, start, batch)
 		body, err := c.doRequest(url)
 		if err != nil {
 			return nil, err
@@ -311,7 +364,7 @@ func spacePath(space string) string {
 // pageEndpoint builds the REST base URL for one page of a (possibly nested) space.
 func (c *XWikiClient) pageEndpoint(space, page string) string {
 	return fmt.Sprintf("%s/rest/wikis/%s/%s/pages/%s",
-		c.BaseURL, xwikiName, spacePath(space), url.PathEscape(page))
+		c.BaseURL, c.WikiName, spacePath(space), url.PathEscape(page))
 }
 
 // GetRenderedHTML fetches the page as rendered XHTML.
@@ -359,15 +412,34 @@ func (c *XWikiClient) doRequest(url string) ([]byte, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status %d from %s: %s", resp.StatusCode, url, string(body))
+		return nil, fmt.Errorf("unexpected status %d from %s: %s",
+			resp.StatusCode, url, shortBody(body))
 	}
 
 	return body, nil
 }
 
+// shortBody trims an error response for display. Proxies answer with full HTML
+// error pages, which would otherwise bury the actual message.
+func shortBody(body []byte) string {
+	text := strings.TrimSpace(string(body))
+	if i := strings.Index(text, "<html"); i >= 0 {
+		if t := strings.Index(text, "<title>"); t >= 0 {
+			if e := strings.Index(text[t:], "</title>"); e > 0 {
+				return strings.TrimSpace(text[t+7 : t+e])
+			}
+		}
+		text = text[:i]
+	}
+	if len(text) > 300 {
+		text = text[:300] + " ..."
+	}
+	return text
+}
+
 // GetSpaces retrieves all spaces from the xWiki instance.
 func (c *XWikiClient) GetSpaces() ([]SpaceEntry, error) {
-	body, err := c.doRequest(fmt.Sprintf("%s/rest/wikis/%s/spaces", c.BaseURL, xwikiName))
+	body, err := c.doRequest(fmt.Sprintf("%s/rest/wikis/%s/spaces", c.BaseURL, c.WikiName))
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +454,7 @@ func (c *XWikiClient) GetSpaces() ([]SpaceEntry, error) {
 
 // GetPages retrieves all pages in a given space.
 func (c *XWikiClient) GetPages(spaceName string) ([]PageSummary, error) {
-	body, err := c.doRequest(fmt.Sprintf("%s/rest/wikis/%s/%s/pages", c.BaseURL, xwikiName, spacePath(spaceName)))
+	body, err := c.doRequest(fmt.Sprintf("%s/rest/wikis/%s/%s/pages", c.BaseURL, c.WikiName, spacePath(spaceName)))
 	if err != nil {
 		return nil, err
 	}
