@@ -147,9 +147,12 @@ Nur den Report (zeigt ohne Confluence-Zugriff, was passieren würde):
 
 ## Offline-Nutzung (portabler Export)
 
-1. Auf einer Maschine mit Internet bauen:
+Eine fertig gebaute `migration.exe` (Windows, 64 Bit) liegt im Repository, Go
+wird zum Ausfuehren also nicht benoetigt.
+
+1. Optional selbst bauen:
    ```bash
-   go build -mod=vendor -o migration.exe .
+   go build -mod=vendor -trimpath -ldflags="-s -w" -o migration.exe .
    ```
    (oder `build.bat`)
 2. `migration.exe` und `.env` auf die Offline-Maschine kopieren.

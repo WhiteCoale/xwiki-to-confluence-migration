@@ -5,7 +5,7 @@ echo Building xWiki to Confluence Migration Tool...
 cd /d "%~dp0"
 
 :: Build with vendored dependencies
-go build -mod=vendor -o migration.exe .
+go build -mod=vendor -trimpath -ldflags="-s -w" -o migration.exe .
 
 if %ERRORLEVEL% EQU 0 (
     echo.

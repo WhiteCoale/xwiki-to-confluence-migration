@@ -1,6 +1,8 @@
 .env
 export/
 *.exe
+# Fertige Binaerdatei wird bewusst mitgeliefert
+!migration.exe
 API_KEY.txt
 ndebug_*
 Anweisung.txt
